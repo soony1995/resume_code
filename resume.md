@@ -1,16 +1,76 @@
 ## REST API 구현
-
 ### 어드민 페이지 API 
-    - 미디어 서버 CRUD API 
-    - CONFIG 파일 CURD API 
-        - ORIGIN, RELAY, EDGE 미디어 서버의 CONFIG 파일(NGINX,JANUS,COTURN)을 역할에 따라 비동기 처리  
+    - 미디어 서버 CURD
+    - conf 파일 CRUD
+        - ORIGIN, RELAY, EDGE 미디어 서버의 CONF 파일(nginx, janus, coturn)을 역할에 따라 비동기 처리  
+> config 파일 세팅 코드 (janus)
+```Go
+...
+defer func() { // 실패했을 경우에 변경 전 파일로 롤백
+		for _, serverInfo := range serverMap {
+			go w.Rollback(serverInfo, isErrExist, "janus")
+		}
+	}()
+for _, serverInfo := range serverMap {
+    go func(serverInfo map[string]interface{}) {
+        defer wg.Done()
+        nat := *janusServerConfig.Nat
+        general := *janusServerConfig.General
+        media := *janusServerConfig.Media
+        janusServerConfigCp := models.JanusServerPayload{
+            Nat:     &nat,
+            General: &general,
+            Media:   &media,
+        }
+        janusServerConfigCp.Nat.StunPort = stunPort
+        internalAddress, ok := serverInfo["internal"].(string)
+        if !ok {
+            w.Log.Errorf("JanusServerConfig: type assertion: %v.(string)", serverInfo["internal"])
+            err = interfaces.ConfigErrorReturn("failed", internalAddress, "unable to modify janus config", nil)
+            ch <- err
+            return
+        }
+        janusServerConfigCp.General.ServerName, janusServerConfigCp.Nat.StunServer = internalAddress, internalAddress
+        serverAddress, ok := serverInfo["server"].(string)
+        if !ok {
+            w.Log.Errorf("JanusServerConfig: type assertion: %v.(string)", serverInfo["server"])
+            err = interfaces.ConfigErrorReturn("failed", internalAddress, "unable to modify janus config", nil)
+            ch <- err
+            return
+        }
+        janusServerConfigCp.ServerAddress, janusServerConfigCp.Nat.Nat_1_1_Mapping = serverAddress, serverAddress
+        if err := w.MakeJanusServerConfig(janusServerConfigCp); err != nil {
+            w.Log.Errorf("JanusServerConfig: unable to make janus config: internalAddress: %s: %v", internalAddress, err)
+            err = interfaces.ConfigErrorReturn("failed", internalAddress, "unable to modify janus config", nil)
+            ch <- err
+            return
+        }
+        if errLog, err := w.JanusConfigCheck(internalAddress); err != nil {
+            w.Log.Errorf("JanusServerConfig: w.JanusConfigCheck(internalAddress: %s): %v: %v", internalAddress, err, errLog)
+            err = interfaces.ConfigErrorReturn("failed", internalAddress, "unable to modify janus config", errLog)
+            ch <- err
+            return
+        }
+        err = interfaces.ConfigErrorReturn("success", internalAddress, "success; janus configCheck", nil)
+        ch <- err
+    }(serverInfo)
+}
+wg.Wait()
+close(ch)
+if sliceErr := w.ChanReceive(len(serverMap), ch); sliceErr != nil {
+    utils.WsErrorHandler(w.Conn, fiber.StatusInternalServerError, w.ApiRequest.Transaction, configs.InternalError)
+    return
+}
+... 
+```
 ### 미디어 서버 API 
     - 비디오룸 
         - 생성, 참가, 유저 강제 퇴장, 레코딩
     - 텍스트룸 
         - 생성, 참가, 레코딩 
-    - 스트리밍룸 
-        - ORIGIN 서버에서 송출하는 미디어 스트림을 RELAY, EDGE 서버에 전달하는 API
+    - 스트리밍룸             
+        - ORIGIN -> RELAY -> EDGE 서버의 스트리밍 관리     
+> streaimg-forward 코드 
 ```GO
 case "streaming-forward":
     // *models.PubInfo, []models.Accesspoint, *models.Streaming    
@@ -58,7 +118,7 @@ case "streaming-forward":
 ```
 
 
-## CUSTOM ERROR CODE 추가를 통해 명확한 에러 정보 제공과 디버깅 용이성 향상
+## 커스텀 에러 코드 사용
 
 ```GO
     //500
@@ -75,8 +135,7 @@ case "streaming-forward":
 	StreamingStartError        = "FAILED_STREAMING_START"
 	StreamingStopError         = "FAILED_STREAMING_STOP"
 ```    
-    에러 핸들러를 이용해 중복을 최소화 및 유지 보수 용이
-
+> 에러 핸들러 이용
 ```go
     func ErrorHandler(c *fiber.Ctx, status int, errCode string) error {
         errMsg := configs.ErrorMessages[errCode]
@@ -95,7 +154,7 @@ case "streaming-forward":
         return c.Status(fiber.StatusOK).JSON(response)
     }
 ```
-    실제 코드
+> 실제 코드
 ```GO
     err := n.AQuery.DemoUpdateAccount(m)
 	if err != nil {
